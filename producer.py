@@ -4,31 +4,25 @@ from dotenv import load_dotenv
 from kafka import KafkaProducer
 import json
 import time
+import logging
 
-# Read the key and secret stored in the .env file
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
 load_dotenv()
-api_key = os.getenv("API_KEY")
+api_key    = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
-# Set up the producer that would send the BTC trade data as bytes
 producer = KafkaProducer(
     bootstrap_servers="localhost:9092",
     value_serializer=lambda v: json.dumps(v).encode("utf-8")
 )
 
-is_running = True  # Flag to stop sending messages
-
-# Define how I handle each message
 def handle_msg(msg):
+    if msg.get('e') == 'error':
+        log.error(f"Error receiving message: {msg.get('m')}")
+        return  # reconnect loop handles restart
 
-    # Ignore messages after shutdown
-    if not is_running:  
-        return
-    
-    if msg['e'] == 'error':
-        print("Error:", msg['m'])
-        return
-    
     trade = {
         "symbol":   msg['s'],
         "price":    msg['p'],
@@ -36,21 +30,38 @@ def handle_msg(msg):
         "side":     "SELL" if msg['m'] else "BUY",
         "time":     msg['T']
     }
-    # If there's no error, send to kafka topic
     producer.send("btc-trades", value=trade)
-    print(f"Sent: {trade}")
+    log.info(f"Sent: {trade}")
 
-# I define a timeout for the connection in seconds
-TIMEOUT = 5
 
-# Manages the Binance websocket connection
-twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
-twm.start()
-twm.start_trade_socket(callback=handle_msg, symbol="BTCUSDT")
+def start_stream():
+    """Start TWM and return (twm, socket_key)."""
+    twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
+    twm.start()
+    key = twm.start_trade_socket(callback=handle_msg, symbol="BTCUSDT")
+    log.info("WebSocket stream started.")
+    return twm, key
 
-time.sleep(TIMEOUT)
-is_running = False
 
-twm.stop()           
-producer.flush()     # Make sure all messages are sent to Kafka
-producer.close()     # Close the Kafka connection
+RECONNECT_DELAY  = 5   # seconds before first retry
+MAX_DELAY        = 60  # cap backoff at 60s
+
+delay = RECONNECT_DELAY
+while True:
+    twm = None
+    try:
+        twm, _ = start_stream()
+        twm.join()                      # blocks until stream stops
+        log.warning("Stream ended unexpectedly, reconnecting...")
+    except Exception as e:
+        log.error(f"Stream error: {e}")
+    finally:
+        try:
+            if twm:
+                twm.stop()
+        except Exception:
+            pass
+
+    log.info(f"Waiting {delay}s before reconnect...")
+    time.sleep(delay)
+    delay = min(delay * 2, MAX_DELAY)  # exponential backoff, capped at 60s
