@@ -5,6 +5,7 @@ from kafka import KafkaProducer
 import json
 import time
 import logging
+import threading
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -18,11 +19,19 @@ producer = KafkaProducer(
     value_serializer=lambda v: json.dumps(v).encode("utf-8")
 )
 
-def handle_msg(msg):
-    if msg.get('e') == 'error':
-        log.error(f"Error receiving message: {msg.get('m')}")
-        return  # reconnect loop handles restart
+_should_reconnect = threading.Event()
+_error_logged = False  # prevent spamming the same error
 
+def handle_msg(msg):
+    global _error_logged
+    if msg.get('e') == 'error':
+        if not _error_logged:
+            log.error(f"WebSocket error: {msg.get('m')}")
+            _error_logged = True
+            _should_reconnect.set()
+        return
+
+    _error_logged = False  # reset on successful message
     trade = {
         "symbol":   msg['s'],
         "price":    msg['p'],
@@ -35,7 +44,6 @@ def handle_msg(msg):
 
 
 def start_stream():
-    """Start TWM and return (twm, socket_key)."""
     twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
     twm.start()
     key = twm.start_trade_socket(callback=handle_msg, symbol="BTCUSDT")
@@ -43,18 +51,25 @@ def start_stream():
     return twm, key
 
 
-RECONNECT_DELAY  = 5   # seconds before first retry
-MAX_DELAY        = 60  # cap backoff at 60s
+RECONNECT_DELAY = 5
+MAX_DELAY       = 60
+delay           = RECONNECT_DELAY
 
-delay = RECONNECT_DELAY
 while True:
     twm = None
+    _should_reconnect.clear()  # ← critical: reset before each attempt
+    _error_logged = False
+
     try:
         twm, _ = start_stream()
-        twm.join()                      # blocks until stream stops
-        log.warning("Stream ended unexpectedly, reconnecting...")
+        _should_reconnect.wait()  # blocks until error fires
+        log.warning("Reconnect signal received, restarting stream...")
+
     except Exception as e:
-        log.error(f"Stream error: {e}")
+        log.error(f"Failed to start stream: {e}")
+        delay = min(delay * 2, MAX_DELAY)
+    else:
+        delay = RECONNECT_DELAY  # reset delay on clean reconnect
     finally:
         try:
             if twm:
@@ -64,4 +79,3 @@ while True:
 
     log.info(f"Waiting {delay}s before reconnect...")
     time.sleep(delay)
-    delay = min(delay * 2, MAX_DELAY)  # exponential backoff, capped at 60s
