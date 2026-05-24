@@ -19,3 +19,5 @@ Real-time BTC trade data pipeline using Binance websocket, that aggregates and d
 5. `python consumer.py` (Terminal 2)
 
 ## Results with Grafana
+
+<img src="assets/grafana_20m.png" width="700" alt="Visualization"/>
